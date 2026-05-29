@@ -1,0 +1,36 @@
+# Competitive Intelligence Demo Runbook
+
+## Prereqs
+- Deployed model endpoints in the selected Foundry project:
+  - `magenticbrain-14b`
+  - `fara15-9b`
+- `.env` created from `.env.example` with:
+  - `*_SCORING_URI` values set to each endpoint `scoring_uri` (already includes `/v1/chat/completions`)
+  - `*_API_KEY` values from `az ml online-endpoint get-credentials`
+- `az login` completed for the target tenant/subscription
+
+## Install
+```powershell
+cd C:\Flutter\magentic-maf-demo
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+## Run
+```powershell
+cd C:\Flutter\magentic-maf-demo
+python -m app.main --query "Create a competitive teardown of Vendor X pricing, launches, and customer sentiment compared to us."
+```
+
+## CUA behavior
+- Fara is run in a screenshot-driven CUA loop per URL.
+- The loop captures browser screenshots, asks Fara for next action (`click_text`, `scroll_down`, `wait`, `finish`), executes the action in Playwright, then synthesizes findings.
+- Screenshots are saved under `reports\screenshots\report-<timestamp>\`.
+
+## Expected output sections
+1. Pricing
+2. Recent Launches
+3. Sentiment Signals
+4. Threats
+5. Opportunities
+6. Sources

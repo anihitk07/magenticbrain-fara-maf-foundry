@@ -1,0 +1,6 @@
+$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineDeployment.schema.json
+name: blue
+endpoint_name: fara15-9b
+model: azureml://registries/azureml-cua-ai-frontiers-p/models/Fara1.5-9B/versions/1
+instance_type: Standard_NC24ads_A100_v4
+instance_count: 1

@@ -1,0 +1,6 @@
+agent-framework
+azure-identity
+beautifulsoup4
+python-dotenv
+requests
+playwright

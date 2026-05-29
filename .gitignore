@@ -1,0 +1,42 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Reports and generated artifacts
+reports/
+**/screenshots/
+
+# Personal LinkedIn / publishing drafts
+LINKEDIN_POST.md
+linkedin*.md
+LinkedIn*.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+ENV/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Playwright local caches
+.playwright/
+playwright-report/
+test-results/
+
+# Logs / temp
+*.log
+*.tmp
