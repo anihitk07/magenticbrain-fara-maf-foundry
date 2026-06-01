@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import json
-from pathlib import Path
+import asyncio
 import base64
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
 import re
+import shutil
+import subprocess
+import sys
+from typing import Any
 from urllib.parse import urlparse
 
 import requests
@@ -15,9 +23,80 @@ from app.tools.files import write_markdown_report
 try:
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     from playwright.async_api import async_playwright
-except ImportError:  # pragma: no cover - explicit runtime error in _run_cua_for_url
+except ImportError:  # pragma: no cover - explicit runtime error in CUA mode
     async_playwright = None
     PlaywrightTimeoutError = Exception
+
+
+class BrowserStrategy:
+    def __init__(self, workflow: CompetitiveIntelWorkflow, output_path: Path):
+        self.workflow = workflow
+        self.output_path = output_path
+
+    async def run_for_url(self, *, url: str, objective: str) -> str:
+        raise NotImplementedError
+
+
+class FaraScreenshotLoopStrategy(BrowserStrategy):
+    async def run_for_url(self, *, url: str, objective: str) -> str:
+        screenshot_root = self.output_path.parent / "screenshots" / self.output_path.stem
+        return await self.workflow._run_cua_for_url(
+            url=url,
+            objective=objective,
+            screenshot_root=screenshot_root,
+        )
+
+
+class WebwrightStrategy(BrowserStrategy):
+    async def run_for_url(self, *, url: str, objective: str) -> str:
+        webwright_root = self.output_path.parent / "webwright" / self.output_path.stem
+        return await asyncio.to_thread(
+            self.workflow._run_webwright_for_url,
+            url,
+            objective,
+            webwright_root,
+            None,
+        )
+
+
+class WebwrightCachedScriptStrategy(BrowserStrategy):
+    def _cache_key(self, *, url: str, objective: str) -> str:
+        host = (urlparse(url).netloc or "site").replace(".", "-")
+        objective_hash = hashlib.sha1(objective.encode("utf-8")).hexdigest()[:12]  # noqa: S324
+        return f"{host}-{objective_hash}.py"
+
+    async def run_for_url(self, *, url: str, objective: str) -> str:
+        webwright_root = self.output_path.parent / "webwright" / self.output_path.stem
+        cache_root = self.output_path.parent / "scripts"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_root / self._cache_key(url=url, objective=objective)
+
+        if cache_path.exists():
+            try:
+                return await asyncio.to_thread(
+                    self.workflow._run_cached_script_for_url,
+                    cache_path,
+                    url,
+                    objective,
+                    webwright_root,
+                )
+            except Exception:
+                # Fallback to a fresh Webwright run and refresh cache if script drifted.
+                return await asyncio.to_thread(
+                    self.workflow._run_webwright_for_url,
+                    url,
+                    objective,
+                    webwright_root,
+                    cache_path,
+                )
+
+        return await asyncio.to_thread(
+            self.workflow._run_webwright_for_url,
+            url,
+            objective,
+            webwright_root,
+            cache_path,
+        )
 
 
 @dataclass
@@ -34,6 +113,13 @@ class CompetitiveIntelWorkflow:
     browser_cua_max_steps: int = 4
     browser_headless: bool = True
     browser_action_timeout_ms: int = 12000
+    browser_mode: str = "cua"
+    browser_task_timeout_seconds: int = 900
+    webwright_step_limit: int = 100
+    webwright_require_self_reflection: bool = True
+    webwright_sandbox_mode: str = "local"
+    webwright_docker_image: str = ""
+    browser_allowed_domains: tuple[str, ...] = ("openai.com", "anthropic.com", "microsoft.com")
     request_timeout_seconds: int = 180
 
     @staticmethod
@@ -117,6 +203,18 @@ class CompetitiveIntelWorkflow:
         slug = f"{host}-{path}" if path else host
         return re.sub(r"[^A-Za-z0-9-]+", "-", slug).strip("-")[:80] or "page"
 
+    def _is_domain_allowed(self, url: str) -> bool:
+        host = (urlparse(url).netloc or "").lower()
+        if not host:
+            return False
+        for domain in self.browser_allowed_domains:
+            normalized = domain.lower().strip()
+            if not normalized:
+                continue
+            if host == normalized or host.endswith(f".{normalized}"):
+                return True
+        return False
+
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, object]:
         cleaned = text.strip()
@@ -180,13 +278,289 @@ class CompetitiveIntelWorkflow:
             )
 
             if finish_reason and finish_reason != "length":
-                # Model stopped for non-length reason but still missed end marker.
-                # One continuation attempt is still requested by the messages above.
                 continue
 
         return "\n".join(part for part in report_parts if part.strip())
 
+    def _make_browser_strategy(self, *, output_path: Path) -> BrowserStrategy:
+        mode = (self.browser_mode or "cua").strip().lower()
+        if mode == "webwright":
+            return WebwrightStrategy(self, output_path)
+        if mode == "webwright-craft":
+            return WebwrightCachedScriptStrategy(self, output_path)
+        return FaraScreenshotLoopStrategy(self, output_path)
+
+    def _webwright_config_specs(self) -> list[str]:
+        return [
+            "base.yaml",
+            "environment.browser_mode=local",
+            "environment.shell=powershell",
+            f"model.model_class=app.integrations.webwright_foundry_backend.WebwrightFoundryModel",
+            f"model.model_name={self.browser_model}",
+            f"model.foundry_endpoint={self.browser_scoring_uri}",
+            f"model.foundry_api_key={self.browser_api_key}",
+            f"agent.step_limit={self.webwright_step_limit}",
+            f"agent.require_self_reflection_success={str(self.webwright_require_self_reflection).lower()}",
+        ]
+
+    @staticmethod
+    def _extract_run_dir_from_webwright_output(output: str) -> Path | None:
+        match = re.search(r"Running task in ([^\r\n]+)", output)
+        if not match:
+            return None
+        candidate = Path(match.group(1).strip())
+        return candidate if candidate.exists() else None
+
+    def _latest_webwright_run_dir(self, *, root: Path, task_slug: str) -> Path | None:
+        candidates = sorted(
+            [path for path in root.glob(f"{task_slug}_*") if path.is_dir()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+
+    def _extract_webwright_final_response(self, trajectory_path: Path) -> str:
+        if not trajectory_path.exists():
+            return ""
+        try:
+            payload = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(payload, list):
+            return ""
+        for item in reversed(payload):
+            if not isinstance(item, dict):
+                continue
+            extra = item.get("extra", {})
+            if not isinstance(extra, dict):
+                continue
+            for key in ("final_response", "submission", "run_exception"):
+                value = extra.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    def _synthesize_notes_from_artifacts(
+        self,
+        *,
+        url: str,
+        objective: str,
+        final_response: str,
+        final_script_text: str,
+        script_log_text: str,
+        screenshot_paths: list[str],
+        mode_label: str,
+    ) -> str:
+        prompt = (
+            f"You are summarizing web-research evidence from {mode_label} artifacts.\n"
+            f"Objective: {objective}\n"
+            f"Target URL: {url}\n\n"
+            f"Final response from run (if present):\n{final_response or 'none'}\n\n"
+            f"Script excerpt:\n{final_script_text or 'none'}\n\n"
+            f"Execution log excerpt:\n{script_log_text or 'none'}\n\n"
+            f"Screenshots captured:\n{chr(10).join(screenshot_paths) if screenshot_paths else 'none'}\n\n"
+            "Return markdown bullet points with concrete facts only, then add one final "
+            "'Source: <url>' line."
+        )
+        return self._chat_completion(
+            scoring_uri=self.browser_scoring_uri,
+            api_key=self.browser_api_key,
+            model=self.browser_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=700,
+            temperature=0.1,
+        )
+
+    def _run_webwright_for_url(
+        self,
+        url: str,
+        objective: str,
+        webwright_root: Path,
+        cache_script_path: Path | None,
+    ) -> str:
+        if not self._is_domain_allowed(url):
+            raise RuntimeError(
+                f"Blocked URL outside allow-list: {url}. "
+                "Set BROWSER_ALLOWED_DOMAINS to include this domain if intentional."
+            )
+
+        webwright_root.mkdir(parents=True, exist_ok=True)
+        task_slug = f"{self._slug_from_url(url)}-{hashlib.sha1(objective.encode('utf-8')).hexdigest()[:8]}"  # noqa: S324
+        before_dirs = {p.resolve() for p in webwright_root.glob(f"{task_slug}_*") if p.is_dir()}
+
+        command: list[str] = [sys.executable, "-m", "webwright.run.cli"]
+        for spec in self._webwright_config_specs():
+            command.extend(["-c", spec])
+        command.extend(
+            [
+                "-t",
+                objective,
+                "--start-url",
+                url,
+                "--task-id",
+                task_slug,
+                "-o",
+                str(webwright_root),
+            ]
+        )
+        if not self.browser_headless:
+            command.append("--debug")
+
+        project_root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            str(project_root)
+            if not existing_pythonpath
+            else f"{project_root}{os.pathsep}{existing_pythonpath}"
+        )
+
+        sandbox_mode = (self.webwright_sandbox_mode or "local").strip().lower()
+        if sandbox_mode == "docker":
+            if not self.webwright_docker_image.strip():
+                raise RuntimeError(
+                    "WEBWRIGHT_SANDBOX_MODE=docker requires WEBWRIGHT_DOCKER_IMAGE to be set."
+                )
+            docker_command = [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{project_root}:/workspace",
+                "-w",
+                "/workspace",
+                "-e",
+                "PYTHONPATH=/workspace",
+                "-e",
+                "OPENAI_API_KEY",
+                "-e",
+                "ANTHROPIC_API_KEY",
+                "-e",
+                "OPENROUTER_API_KEY",
+                self.webwright_docker_image.strip(),
+                "python",
+                *command[1:],
+            ]
+            run = subprocess.run(
+                docker_command,
+                capture_output=True,
+                text=True,
+                timeout=self.browser_task_timeout_seconds,
+                env=env,
+                check=False,
+            )
+        else:
+            run = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                cwd=str(project_root),
+                timeout=self.browser_task_timeout_seconds,
+                env=env,
+                check=False,
+            )
+        output = (run.stdout or "") + "\n" + (run.stderr or "")
+        run_dir = self._extract_run_dir_from_webwright_output(output)
+        if run_dir is None:
+            after_dirs = {p.resolve() for p in webwright_root.glob(f"{task_slug}_*") if p.is_dir()}
+            created_dirs = sorted(
+                [p for p in after_dirs - before_dirs if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if created_dirs:
+                run_dir = created_dirs[0]
+            else:
+                run_dir = self._latest_webwright_run_dir(root=webwright_root, task_slug=task_slug)
+
+        if run.returncode != 0:
+            tail = output[-4000:] if output else "(no command output)"
+            raise RuntimeError(f"Webwright run failed for {url}.\n{tail}")
+        if run_dir is None:
+            raise RuntimeError(f"Webwright did not produce an output directory for {url}.")
+
+        final_script_path = run_dir / "final_script.py"
+        if cache_script_path is not None and final_script_path.exists():
+            cache_script_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(final_script_path, cache_script_path)
+
+        trajectory_path = run_dir / "trajectory.json"
+        script_log_candidates = sorted(run_dir.glob("final_runs/*/final_script_log.txt"))
+        script_log_path = script_log_candidates[-1] if script_log_candidates else None
+
+        final_script_text = ""
+        if final_script_path.exists():
+            final_script_text = final_script_path.read_text(encoding="utf-8", errors="replace")[:12000]
+        script_log_text = ""
+        if script_log_path is not None and script_log_path.exists():
+            script_log_text = script_log_path.read_text(encoding="utf-8", errors="replace")[-8000:]
+        screenshots = sorted(path.relative_to(run_dir).as_posix() for path in run_dir.rglob("*.png"))[:30]
+        final_response = self._extract_webwright_final_response(trajectory_path)
+
+        return self._synthesize_notes_from_artifacts(
+            url=url,
+            objective=objective,
+            final_response=final_response,
+            final_script_text=final_script_text,
+            script_log_text=script_log_text,
+            screenshot_paths=screenshots,
+            mode_label="Webwright",
+        )
+
+    def _run_cached_script_for_url(
+        self,
+        script_path: Path,
+        url: str,
+        objective: str,
+        webwright_root: Path,
+    ) -> str:
+        if not self._is_domain_allowed(url):
+            raise RuntimeError(
+                f"Blocked URL outside allow-list: {url}. "
+                "Set BROWSER_ALLOWED_DOMAINS to include this domain if intentional."
+            )
+
+        webwright_root.mkdir(parents=True, exist_ok=True)
+        run_slug = f"cached-{self._slug_from_url(url)}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        run_dir = webwright_root / run_slug
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env["WORKSPACE_DIR"] = str(run_dir)
+        env["START_URL"] = url
+
+        run = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            cwd=str(run_dir),
+            timeout=self.browser_task_timeout_seconds,
+            env=env,
+            check=False,
+        )
+        output = (run.stdout or "") + "\n" + (run.stderr or "")
+        if run.returncode != 0:
+            tail = output[-4000:] if output else "(no command output)"
+            raise RuntimeError(f"Cached script run failed for {url}.\n{tail}")
+
+        screenshots = sorted(path.relative_to(run_dir).as_posix() for path in run_dir.rglob("*.png"))[:30]
+        return self._synthesize_notes_from_artifacts(
+            url=url,
+            objective=objective,
+            final_response=(run.stdout or "")[-2000:],
+            final_script_text=script_path.read_text(encoding="utf-8", errors="replace")[:12000],
+            script_log_text=output[-8000:],
+            screenshot_paths=screenshots,
+            mode_label="cached Webwright script",
+        )
+
     async def _run_cua_for_url(self, *, url: str, objective: str, screenshot_root: Path) -> str:
+        if not self._is_domain_allowed(url):
+            raise RuntimeError(
+                f"Blocked URL outside allow-list: {url}. "
+                "Set BROWSER_ALLOWED_DOMAINS to include this domain if intentional."
+            )
+
         if async_playwright is None:
             raise RuntimeError(
                 "playwright is required for CUA mode. Install dependencies and run: python -m playwright install chromium"
@@ -287,7 +661,7 @@ class CompetitiveIntelWorkflow:
             f"Visible page text excerpt:\n{visible_text}\n\n"
             "Return markdown bullet points only with concrete facts, then a short 'Source:' line with the URL."
         )
-        synthesis = self._chat_completion(
+        return self._chat_completion(
             scoring_uri=self.browser_scoring_uri,
             api_key=self.browser_api_key,
             model=self.browser_model,
@@ -295,7 +669,6 @@ class CompetitiveIntelWorkflow:
             max_tokens=550,
             temperature=0.1,
         )
-        return synthesis
 
     async def run(self, user_query: str, output_path: Path) -> Path:
         context = ResearchContext()
@@ -331,9 +704,9 @@ URLS:
                 "https://www.microsoft.com/en-us/research/blog/",
             ]
 
-        screenshot_root = output_path.parent / "screenshots" / output_path.stem
+        browser_strategy = self._make_browser_strategy(output_path=output_path)
         for url in urls[:3]:
-            findings = await self._run_cua_for_url(url=url, objective=user_query, screenshot_root=screenshot_root)
+            findings = await browser_strategy.run_for_url(url=url, objective=user_query)
             context.add(url, findings)
 
         report_markdown = self._generate_complete_report(

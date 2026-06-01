@@ -23,8 +23,10 @@ python -m app.main --query "Create a competitive teardown of Vendor X pricing, l
 ```
 
 ## CUA behavior
-- Fara is run in a screenshot-driven CUA loop per URL.
-- The loop captures browser screenshots, asks Fara for next action (`click_text`, `scroll_down`, `wait`, `finish`), executes the action in Playwright, then synthesizes findings.
+- `BROWSER_MODE=cua` runs Fara in a screenshot-driven loop per URL.
+- `BROWSER_MODE=webwright` runs Webwright's terminal-driven browser loop using the Foundry endpoint as model backend.
+- `BROWSER_MODE=webwright-craft` adds script caching/reuse for repeatable tasks.
+- For `cua`, the loop captures browser screenshots, asks Fara for next action (`click_text`, `scroll_down`, `wait`, `finish`), executes the action in Playwright, then synthesizes findings.
 - Screenshots are saved under `reports\screenshots\report-<timestamp>\`.
 
 ## Expected output sections

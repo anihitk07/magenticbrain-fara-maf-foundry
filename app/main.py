@@ -18,6 +18,14 @@ def _get_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _get_csv_list(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return default
+    values = [item.strip() for item in raw.split(",")]
+    return [item for item in values if item]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Magentic/Fara competitive-intel multi-agent demo")
     parser.add_argument("--query", required=True, help="Competitive intelligence question to analyze")
@@ -55,6 +63,18 @@ async def run() -> None:
         browser_cua_max_steps=int(os.getenv("BROWSER_CUA_MAX_STEPS", "4")),
         browser_headless=_get_bool("BROWSER_HEADLESS", True),
         browser_action_timeout_ms=int(os.getenv("BROWSER_ACTION_TIMEOUT_MS", "12000")),
+        browser_mode=os.getenv("BROWSER_MODE", "cua"),
+        browser_task_timeout_seconds=int(os.getenv("BROWSER_TASK_TIMEOUT_SECONDS", "900")),
+        webwright_step_limit=int(os.getenv("WEBWRIGHT_STEP_LIMIT", "100")),
+        webwright_require_self_reflection=_get_bool("WEBWRIGHT_REQUIRE_SELF_REFLECTION", True),
+        webwright_sandbox_mode=os.getenv("WEBWRIGHT_SANDBOX_MODE", "local"),
+        webwright_docker_image=os.getenv("WEBWRIGHT_DOCKER_IMAGE", ""),
+        browser_allowed_domains=tuple(
+            _get_csv_list(
+                "BROWSER_ALLOWED_DOMAINS",
+                ["openai.com", "anthropic.com", "microsoft.com"],
+            )
+        ),
     )
     final_path = await workflow.run(args.query, output_path)
     print(f"Report written to: {final_path}")

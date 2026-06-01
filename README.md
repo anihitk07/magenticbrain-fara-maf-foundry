@@ -3,7 +3,7 @@
 A reference implementation that wires Microsoft Research's brand‑new small agentic models — **MagenticBrain‑14B** (orchestrator) and **Fara1.5‑9B** (browser computer‑use agent) — into a multi‑agent **Competitive Intelligence Analyst** running on **Azure AI Foundry hub‑based projects**.
 
 > 🧠 MagenticBrain plans, codes, and delegates.
-> 🖥️ Fara1.5 drives a real browser via screenshot → action → screenshot loops.
+> 🖥️ Fara1.5 can run in two CUA paths: direct screenshot-action loop or Webwright terminal-driven browser automation.
 > 📑 A reporter agent compiles a complete competitive teardown into Markdown.
 
 ---
@@ -29,11 +29,10 @@ This repo shows how to:
 │   1. Planner agent ─► MagenticBrain‑14B                            │
 │        proposes plan + target URLs                                  │
 │                                                                     │
-│   2. Browser agent  ─► Fara1.5‑9B (CUA loop)                       │
-│        for each URL:                                                │
-│           Playwright screenshot ──► Fara decides next action       │
-│           (click_text | scroll_down | wait | finish)                │
-│           Playwright executes ──► repeat ──► synthesize findings   │
+│   2. Browser agent  ─► Fara1.5‑9B                                   │
+│        mode=cua: screenshot ─► action ─► execute                    │
+│        mode=webwright: terminal code loop via Webwright             │
+│        mode=webwright-craft: cache + reuse generated scripts        │
 │                                                                     │
 │   3. Reporter agent ─► MagenticBrain‑14B                           │
 │        continuation‑based generation, ends on END_OF_REPORT        │
@@ -94,7 +93,7 @@ Or run the convenience script:
 .\deploy\deploy-models.ps1 `
   -SubscriptionId <SUB_ID> `
   -ResourceGroup <RG> `
-  -Workspace <PROJECT_WORKSPACE>
+  -WorkspaceName <PROJECT_WORKSPACE>
 ```
 
 The deployment YAMLs reference:
@@ -108,14 +107,14 @@ When you're done, tear them down to stop GPU charges:
 .\deploy\teardown-models.ps1 `
   -SubscriptionId <SUB_ID> `
   -ResourceGroup <RG> `
-  -Workspace <PROJECT_WORKSPACE>
+  -WorkspaceName <PROJECT_WORKSPACE>
 ```
 
 ---
 
 ## 2) Configure the app
 
-Install dependencies (including the Playwright browser):
+Install dependencies (including Playwright and pinned Webwright):
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -132,9 +131,16 @@ PLANNER_MODEL=MagenticBrain-14B
 BROWSER_SCORING_URI=https://<your-fara-endpoint>.<region>.inference.ml.azure.com/v1/chat/completions
 BROWSER_API_KEY=<endpoint-key>
 BROWSER_MODEL=Fara1.5-9B
+BROWSER_MODE=cua
 BROWSER_CUA_MAX_STEPS=4
 BROWSER_HEADLESS=true
 BROWSER_ACTION_TIMEOUT_MS=12000
+BROWSER_TASK_TIMEOUT_SECONDS=900
+WEBWRIGHT_STEP_LIMIT=100
+WEBWRIGHT_REQUIRE_SELF_REFLECTION=true
+WEBWRIGHT_SANDBOX_MODE=local
+WEBWRIGHT_DOCKER_IMAGE=
+BROWSER_ALLOWED_DOMAINS=openai.com,anthropic.com,microsoft.com
 
 REPORTER_SCORING_URI=https://<your-magenticbrain-endpoint>.<region>.inference.ml.azure.com/v1/chat/completions
 REPORTER_API_KEY=<endpoint-key>
@@ -147,7 +153,18 @@ REPORT_OUTPUT_DIR=reports
 > `az ml online-endpoint show -n <endpoint-name> -g <rg> -w <project> --query scoring_uri -o tsv`
 > `az ml online-endpoint get-credentials -n <endpoint-name> -g <rg> -w <project> --query primaryKey -o tsv`
 
-To watch the CUA loop drive a visible browser, set `BROWSER_HEADLESS=false`.
+To watch the browser UI live, set `BROWSER_HEADLESS=false`.
+
+### Browser modes
+
+- `BROWSER_MODE=cua` (default): direct screenshot→action loop in `app/orchestrator.py`.
+- `BROWSER_MODE=webwright`: use the Webwright runner (`python -m webwright.run.cli`) with a Foundry-managed-endpoint model backend.
+- `BROWSER_MODE=webwright-craft`: same as `webwright`, plus cache the generated `final_script.py` and reuse it on later runs.
+
+Safety controls:
+
+- `BROWSER_ALLOWED_DOMAINS` enforces a domain allow-list before any CUA step.
+- `WEBWRIGHT_SANDBOX_MODE=docker` runs Webwright inside a container when `WEBWRIGHT_DOCKER_IMAGE` is supplied.
 
 ---
 
@@ -204,6 +221,7 @@ magentic-maf-demo/
 - **Why a custom harness?** The official harness (MagenticLite) is opinionated; this repo deliberately uses a small Python harness so the deployment + CUA wiring is easy to read end‑to‑end.
 - **Why continuation‑based reporting?** Long, multi‑section reports can exceed `max_tokens` in a single response. The reporter loops with `finish_reason=length` and an `END_OF_REPORT` sentinel to guarantee complete output.
 - **Why Playwright?** Fara1.5 is a vision/CUA model — it expects to reason over screenshots. Playwright captures screenshots, executes actions Fara returns (`click_text`, `scroll_down`, `wait`, `finish`), and produces an auditable per‑step image trail.
+- **Why Webwright support?** For longer or more complex browsing tasks, Webwright's terminal/code action space can be more robust than single primitive actions. This repo exposes it behind `BROWSER_MODE=webwright`.
 
 ---
 

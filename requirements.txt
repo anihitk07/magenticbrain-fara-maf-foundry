@@ -4,3 +4,5 @@ beautifulsoup4
 python-dotenv
 requests
 playwright
+# Optional browser-strategy backend (pinned SHA for reproducibility)
+webwright @ git+https://github.com/microsoft/Webwright@734bc60ea73653498215694d0cc4bc96fbc09e9c
