@@ -8,6 +8,18 @@ A reference implementation that wires Microsoft Research's brand‑new small age
 
 ---
 
+## What's new
+
+- ✅ **Webwright integration** — Fara/MagenticBrain can now drive a [Webwright](https://github.com/microsoft/Webwright) terminal+workspace agent loop in addition to the original screenshot→action CUA loop.
+- ✅ **`BROWSER_MODE` switch** — pick `cua`, `webwright`, or `webwright-craft` (cached, replayable per-target scripts) via a single env var. The original Fara CUA loop still works exactly as before.
+- ✅ **Foundry-native Webwright backend** — `app/integrations/webwright_foundry_backend.py` lets Webwright call the deployed Foundry managed endpoints (Bearer-auth + OpenAI chat completions schema) instead of OpenAI/Anthropic APIs.
+- ✅ **Safety knobs** — domain allow-list (`BROWSER_ALLOWED_DOMAINS`), optional Docker sandbox (`WEBWRIGHT_SANDBOX_MODE`), per-task timeout, step limit, and optional self-reflection gate.
+- ✅ **Richer audit artifacts** in Webwright mode — per-task `trajectory.json`, `steps/`, `screenshots/`, raw model responses, and a regenerable `final_script.py` under `reports\webwright\...`.
+
+
+
+---
+
 ## Why this repo
 
 These two models were released as part of Microsoft Research's [MagenticLite, MagenticBrain, Fara1.5 announcement](https://www.microsoft.com/en-us/research/blog/magenticlite-magenticbrain-fara1-5-an-agentic-experience-optimized-for-small-models/). They are designed to be **codesigned** — small models + a tight harness — and they currently ship via the **hub‑based** Foundry catalog (`ai.azure.com/catalog`), not the new Foundry resource (project‑centric) catalog.
@@ -157,14 +169,22 @@ To watch the browser UI live, set `BROWSER_HEADLESS=false`.
 
 ### Browser modes
 
-- `BROWSER_MODE=cua` (default): direct screenshot→action loop in `app/orchestrator.py`.
-- `BROWSER_MODE=webwright`: use the Webwright runner (`python -m webwright.run.cli`) with a Foundry-managed-endpoint model backend.
-- `BROWSER_MODE=webwright-craft`: same as `webwright`, plus cache the generated `final_script.py` and reuse it on later runs.
+| Mode | What runs the browser | When to choose it |
+| --- | --- | --- |
+| `cua` (default) | Fara1.5 picks one atomic action per step (`click_text` / `scroll_down` / `wait` / `finish`); your Playwright loop executes it. | Single‑page, screenshot‑first tasks; cheapest and simplest. |
+| `webwright` | Webwright runs a workspace/session agent loop that writes and executes Playwright/Python code. | Multi‑page, longer‑horizon flows; richer trajectory + script artifacts. |
+| `webwright-craft` | First run uses Webwright to generate `final_script.py`; subsequent runs replay the cached script with no LLM calls for the browser stage, falling back to Webwright if it fails. | Repeated runs on the same competitor/target; amortizes LLM cost. |
 
-Safety controls:
+Safety controls (apply across modes):
 
-- `BROWSER_ALLOWED_DOMAINS` enforces a domain allow-list before any CUA step.
+- `BROWSER_ALLOWED_DOMAINS` enforces a domain allow-list before any CUA / Webwright step.
 - `WEBWRIGHT_SANDBOX_MODE=docker` runs Webwright inside a container when `WEBWRIGHT_DOCKER_IMAGE` is supplied.
+- `BROWSER_TASK_TIMEOUT_SECONDS`, `WEBWRIGHT_STEP_LIMIT`, and `WEBWRIGHT_REQUIRE_SELF_REFLECTION` bound runtime cost and provide an optional verification gate.
+
+Note on `BROWSER_HEADLESS`:
+
+- In `cua` mode it controls Playwright directly (`headless=False` → visible Chromium).
+- In `webwright` / `webwright-craft` modes, `BROWSER_HEADLESS=false` forwards `--debug` to the Webwright runner.
 
 ---
 
@@ -177,7 +197,8 @@ python -m app.main --query "Create a competitive teardown of OpenAI vs Anthropic
 Output:
 
 - Markdown report: `reports\report-<timestamp>.md`
-- Screenshot evidence per URL/step: `reports\screenshots\report-<timestamp>\*.png`
+- Screenshot evidence per URL/step (CUA mode): `reports\screenshots\report-<timestamp>\*.png`
+- Webwright per-task workspace (Webwright modes): `reports\webwright\report-<timestamp>\<task>\` with `trajectory.json`, `steps/`, `screenshots/`, raw model responses, and the generated `final_script.py`.
 
 Sample sections in the generated report:
 
